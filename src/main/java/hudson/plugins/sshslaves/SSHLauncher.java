@@ -604,7 +604,11 @@ public class SSHLauncher extends ComputerLauncher {
         Thread.sleep(millis);
 
         final Session session = connection.openSession();
-        final String cmd = "pgrep -lf '\"" + workingDirectory + "\"' | grep slave.jar | grep -v grep";
+
+        // TODO: Make better grep
+        final String cmd = "ps -ef | egrep \"[\\\"\\\']" + workingDirectory + "[\\\"\\\']\" | grep slave.jar | grep -v grep";
+        System.out.println("Executing: " + cmd);
+
         session.execCommand(cmd);
         // don't know if necessary but why not...
         session.waitForCondition(ChannelCondition.STDOUT_DATA, 10);
