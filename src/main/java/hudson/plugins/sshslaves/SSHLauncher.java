@@ -607,7 +607,7 @@ public class SSHLauncher extends ComputerLauncher {
 
         // TODO: Make better grep
         final String cmd = "ps -ef | egrep \"[\\\"\\\']" + workingDirectory + "[\\\"\\\']\" | grep slave.jar | grep -v grep";
-        System.out.println("Executing: " + cmd);
+        //System.out.println("Executing: " + cmd);
 
         session.execCommand(cmd);
         // don't know if necessary but why not...
