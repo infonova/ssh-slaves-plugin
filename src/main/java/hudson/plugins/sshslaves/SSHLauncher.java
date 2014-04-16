@@ -789,8 +789,8 @@ public class SSHLauncher extends ComputerLauncher {
         final Session session = connection.openSession();
 
         // TODO: Make better grep
-        final String cmd = "ps -ef | egrep \"[\\\"\\\']" + workingDirectory
-                        + "[\\\"\\\']\" | grep slave.jar | grep -v grep";
+        final String cmd = "ps -ef | egrep \"[\\\"\\\']*" + workingDirectory
+                        + "[\\\"\\\']*\" | grep slave.jar | grep -v grep";
         // System.out.println("Executing: " + cmd);
 
         session.execCommand(cmd);
