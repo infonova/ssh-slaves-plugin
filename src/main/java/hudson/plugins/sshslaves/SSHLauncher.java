@@ -46,10 +46,13 @@ import com.trilead.ssh2.SFTPv3Client;
 import com.trilead.ssh2.SFTPv3FileAttributes;
 import com.trilead.ssh2.Session;
 import com.trilead.ssh2.transport.TransportManager;
+
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.AbortException;
 import hudson.EnvVars;
 import hudson.Extension;
+import hudson.FilePath;
+import hudson.Launcher;
 import hudson.Util;
 import hudson.model.Descriptor;
 import hudson.model.Hudson;
@@ -69,12 +72,14 @@ import hudson.tools.JDKInstaller.CPU;
 import hudson.tools.JDKInstaller.Platform;
 import hudson.tools.ToolLocationNodeProperty;
 import hudson.tools.ToolLocationNodeProperty.ToolLocation;
+import hudson.util.ArgumentListBuilder;
 import hudson.util.DescribableList;
 import hudson.util.IOException2;
 import hudson.util.ListBoxModel;
 import hudson.util.NullStream;
 import hudson.util.Secret;
 import jenkins.model.Jenkins;
+
 import org.acegisecurity.context.SecurityContext;
 import org.acegisecurity.context.SecurityContextHolder;
 import org.apache.commons.codec.binary.Base64;
@@ -96,6 +101,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.io.PrintStream;
 import java.io.StringWriter;
 import java.lang.InterruptedException;
@@ -110,6 +116,7 @@ import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
@@ -121,7 +128,9 @@ import java.util.logging.Logger;
 import java.util.regex.Pattern;
 
 import static com.cloudbees.plugins.credentials.CredentialsMatchers.*;
+
 import com.cloudbees.plugins.credentials.common.StandardUsernameListBoxModel;
+
 import static hudson.Util.*;
 import hudson.model.Computer;
 import hudson.security.AccessControlled;
@@ -131,6 +140,99 @@ import static java.util.logging.Level.*;
  * A computer launcher that tries to start a linux slave by opening an SSH connection and trying to find java.
  */
 public class SSHLauncher extends ComputerLauncher {
+
+    private static class JDKInstallerWrapper extends JDKInstaller {
+
+        public JDKInstallerWrapper(JDKInstaller jdkInstaller) {
+            this(jdkInstaller.id, jdkInstaller.acceptLicense);
+        }
+
+        public JDKInstallerWrapper(String id, boolean acceptLicense) {
+            super(id, acceptLicense);
+        }
+
+        private boolean isJava15() {
+            return id.contains("-1.5");
+        }
+
+        private boolean isJava14() {
+            return id.contains("-1.4");
+        }
+
+        /**
+         * For CYGWIN the installer needs to be started like this:
+         * /path/to/jdk.exe /s ADDLOCAL="ToolsFeature" REBOOT=ReallySuppress
+         * INSTALLDIR=C:\path\to\jdk '/L \"C:\path\to\log.file\"' (bash) (win
+         * installer) (win installer)
+         */
+        public void installOnCygwin(Launcher launcher, FileSystem fs, TaskListener log, String expectedLocation,
+                        String jdkBundle) throws IOException, InterruptedException {
+            PrintStream out = log.getLogger();
+
+            out.println("Installing " + jdkBundle + " on CYGWIN");
+            String logFile = jdkBundle + ".install.log";
+
+            expectedLocation = expectedLocation.trim();
+            if (expectedLocation.endsWith("\\")) {
+                // Prevent a trailing slash from escaping quotes
+                expectedLocation = expectedLocation.substring(0, expectedLocation.length() - 1);
+            }
+            ArgumentListBuilder args = new ArgumentListBuilder();
+            assert (new File(expectedLocation).exists()) : expectedLocation
+                            + " must exist, otherwise /L will cause the installer to fail with error 1622";
+            if (isJava15() || isJava14()) {
+                // Installer uses InstallShield.
+                args.add("CMD.EXE", "/C");
+
+                // CMD.EXE /C must be followed by a single parameter (do not
+                // split it!)
+                args.add(jdkBundle + " /s /v\"/qn REBOOT=ReallySuppress INSTALLDIR=\\\"" + expectedLocation
+                                + "\\\" /L \\\"" + expectedLocation + "\\jdk.exe.install.log\\\"\"");
+            } else {
+                // Installed uses Windows Installer (MSI)
+                // /opt/slave/jdk.exe /s ADDLOCAL="ToolsFeature"
+                // REBOOT=ReallySuppress INSTALLDIR=`cygpath -C ANSI -w
+                // /opt/slave/jdk` /L `cygpath -C ANSI -w
+                // /opt/slave/jdk.exe.install.log
+                // args.add(jdkBundle, "/s");
+
+                // Create a private JRE by omitting "PublicjreFeature"
+                // @see
+                // http://docs.oracle.com/javase/7/docs/webnotes/install/windows/jdk-installation-windows.html#jdk-silent-installation
+                // args.add("ADDLOCAL=\"ToolsFeature\"");
+
+                // args.add("REBOOT=ReallySuppress", "INSTALLDIR=" +
+                // expectedLocation,
+                // "/L \\\"" + expectedLocation + "\\jdk.exe.install.log\\\"");
+                // args.add("REBOOT=ReallySuppress", //
+                // "INSTALLDIR=`cygpath -C ANSI -w " + expectedLocation + "`",
+                // "/L `cygpath -C ANSI -w " + logFile + "`");
+
+                args.add("/opt/slave/jdk.exe", "/s");
+                args.add("ADDLOCAL=ToolsFeature");
+                args.add("REBOOT=ReallySuppress");
+                args.add("INSTALLDIR=`cygpath -C ANSI -w /opt/slave/jdk`");
+                args.add("/L `cygpath -C ANSI -w /opt/slave/jdk.exe.install.log`");
+
+            }
+            int r = launcher.launch().cmds(args).stdout(out).pwd(new FilePath(launcher.getChannel(), expectedLocation))
+                            .join();
+            if (r != 0) {
+                out.println(Messages.JDKInstaller_FailedToInstallJDK(r));
+                // log file is in UTF-16
+                InputStreamReader in = new InputStreamReader(fs.read(logFile), "UTF-16");
+                try {
+                    IOUtils.copy(in, new OutputStreamWriter(out));
+                } finally {
+                    in.close();
+                }
+                throw new AbortException();
+            }
+
+            fs.delete(logFile);
+
+        }
+    }
 
     /**
      * The scheme requirement.
@@ -210,7 +312,7 @@ public class SSHLauncher extends ComputerLauncher {
      * to install JDK, keep this field null. This avoids baking the default value into the persisted form.
      * @see #getJDKInstaller()
      */
-    private JDKInstaller jdk = null;
+    private JDKInstallerWrapper jdk = null;
 
     /**
      * SSH connection to the slave.
@@ -396,7 +498,7 @@ public class SSHLauncher extends ComputerLauncher {
         this.credentialsId = null;
         this.javaPath = fixEmpty(javaPath);
         if (jdkInstaller != null) {
-            this.jdk = jdkInstaller;
+            this.jdk = new JDKInstallerWrapper(jdkInstaller);
         }
         this.prefixStartSlaveCmd = fixEmpty(prefixStartSlaveCmd);
         this.suffixStartSlaveCmd = fixEmpty(suffixStartSlaveCmd);
@@ -452,7 +554,7 @@ public class SSHLauncher extends ComputerLauncher {
         this.credentialsId = credentials == null ? null : credentials.getId();
         this.javaPath = fixEmpty(javaPath);
         if (jdkInstaller != null) {
-            this.jdk = jdkInstaller;
+            this.jdk = new JDKInstallerWrapper(jdkInstaller);
         }
         this.prefixStartSlaveCmd = fixEmpty(prefixStartSlaveCmd);
         this.suffixStartSlaveCmd = fixEmpty(suffixStartSlaveCmd);
@@ -686,6 +788,52 @@ public class SSHLauncher extends ComputerLauncher {
     }
 
     /**
+     * Verifies if there is no running slave process which uses the same
+     * workingDirectory on the given host.
+     *
+     * @param listener
+     *            The Listener (used for logging stuff).
+     * @param workingDirectory
+     *            Configured working directory for the node.
+     * @throws IOException
+     *             When there is a running slave process in the same
+     *             workingDirectory on the given host.
+     */
+    @SuppressWarnings("unchecked")
+    private void verifyNoRunningSlaveProcess(final TaskListener listener, final String workingDirectory)
+                    throws InterruptedException, IOException {
+        // Sleep random time (Kind of collision prevention for simultaneous
+        // slave launch on startup.)
+        // TODO: Make the value configurable in the node config.
+        long millis = (long) new Random(System.currentTimeMillis()).nextInt(10000);
+        Thread.sleep(millis);
+
+        final Session session = connection.openSession();
+
+        // TODO: Make better grep
+        final String cmd = "ps -ef | egrep \"[\\\"\\\']*" + workingDirectory
+                        + "[\\\"\\\']*\" | grep -v grep";
+        // System.out.println("Executing: " + cmd);
+        // listener.getLogger().println("cmd: " + cmd);
+
+        session.execCommand(cmd);
+        // don't know if necessary but why not...
+        session.waitForCondition(ChannelCondition.STDOUT_DATA, 10);
+
+        // get stdout and see if there was anything returned...
+        final InputStream out = session.getStdout();
+        List<String> lines = IOUtils.readLines(out);
+        if (!lines.isEmpty()) {
+            // ...if so, there is a process running
+            throw new IOException(Messages.SSHLauncher_SlaveAlreadyRunning(lines.get(0)));
+        } else {
+            // ...if not, then proceed (and log some info)
+            listener.getLogger().println(Messages.SSHLauncher_NoSlaveRunning(getTimestamp()));
+        }
+
+    }
+
+    /**
      * {@inheritDoc}
      */
     @Override
@@ -706,6 +854,11 @@ public class SSHLauncher extends ComputerLauncher {
                     String java = resolveJava(computer, listener);
 
                     String workingDirectory = getWorkingDirectory(computer);
+
+                    // TODO: Make it configurable in Node config whether this will be
+                    // executed or not.
+                    verifyNoRunningSlaveProcess(listener, workingDirectory);
+
                     copySlaveJar(listener, workingDirectory);
 
                     startSlave(computer, listener, java, workingDirectory);
@@ -760,7 +913,7 @@ public class SSHLauncher extends ComputerLauncher {
      * Called to terminate the SSH connection. Used liberally when we back out from an error.
      */
     private void cleanupConnection(TaskListener listener) {
-        // we might be called multiple times from multiple finally/catch block, 
+        // we might be called multiple times from multiple finally/catch block,
         if (connection!=null) {
             connection.close();
             connection = null;
@@ -860,8 +1013,8 @@ public class SSHLauncher extends ComputerLauncher {
         }
     }
 
-    private JDKInstaller getJDKInstaller() {
-        return jdk!=null ? jdk : new JDKInstaller(SSHLauncher.DEFAULT_JDK, true);
+    private JDKInstallerWrapper getJDKInstaller() {
+        return jdk!=null ? jdk : new JDKInstallerWrapper(SSHLauncher.DEFAULT_JDK, true);
     }
 
     /**
@@ -913,7 +1066,18 @@ public class SSHLauncher extends ComputerLauncher {
         Util.copyStreamAndClose(bundle.openStream(),new BufferedOutputStream(sftp.writeToFile(bundleFile),32*1024));
         sftp.chmod(bundleFile,0755);
 
-        getJDKInstaller().install(new RemoteLauncher(listener,connection),p,new SFTPFileSystem(sftp),listener, javaDir,bundleFile);
+        if (uname.contains("CYGWIN")) {
+            // FIXME workaround til' permissions on windows with cygwin work as
+            // expected
+            sftp.chmod(javaDir, 0777);
+            getJDKInstaller().installOnCygwin(new RemoteLauncher(listener, connection), new SFTPFileSystem(sftp),
+                            listener, javaDir, bundleFile);
+
+        } else {
+            getJDKInstaller().install(new RemoteLauncher(listener, connection), p, new SFTPFileSystem(sftp), listener,
+                            javaDir, bundleFile);
+        }
+
         return javaDir+"/bin/java";
     }
 
@@ -1081,59 +1245,59 @@ public class SSHLauncher extends ComputerLauncher {
         final String result = checkJavaVersion(listener.getLogger(), javaCommand, r, output);
 
         if(null == result) {
-        	listener.getLogger().println(Messages.SSHLauncher_UknownJavaVersion(javaCommand));
-        	listener.getLogger().println(output);
-        	throw new IOException(Messages.SSHLauncher_UknownJavaVersion(javaCommand));
+            listener.getLogger().println(Messages.SSHLauncher_UknownJavaVersion(javaCommand));
+            listener.getLogger().println(output);
+            throw new IOException(Messages.SSHLauncher_UknownJavaVersion(javaCommand));
         } else {
-        	return result;
+            return result;
         }
     }
 
     // XXX switch to standard method in 1.479+
-	/**
-	 * Given the output of "java -version" in <code>r</code>, determine if this
-	 * version of Java is supported. This method has default visiblity for testing.
-	 *
-	 * @param logger
-	 *            where to log the output
-	 * @param javaCommand
-	 *            the command executed, used for logging
-	 * @param r
-	 *            the output of "java -version"
-	 * @param output
-	 *            copy the data from <code>r</code> into this output buffer
-	 */
-	protected String checkJavaVersion(final PrintStream logger, String javaCommand,
-			final BufferedReader r, final StringWriter output)
-			throws IOException {
-		String line;
-		while (null != (line = r.readLine())) {
-			output.write(line);
-			output.write("\n");
-			line = line.toLowerCase();
-			if (line.startsWith("java version \"")
-					|| line.startsWith("openjdk version \"")) {
-				final String versionStr = line.substring(
-						line.indexOf('\"') + 1, line.lastIndexOf('\"'));
-				logger.println(Messages.SSHLauncher_JavaVersionResult(
-						getTimestamp(), javaCommand, versionStr));
+    /**
+     * Given the output of "java -version" in <code>r</code>, determine if this
+     * version of Java is supported. This method has default visiblity for testing.
+     *
+     * @param logger
+     *            where to log the output
+     * @param javaCommand
+     *            the command executed, used for logging
+     * @param r
+     *            the output of "java -version"
+     * @param output
+     *            copy the data from <code>r</code> into this output buffer
+     */
+    protected String checkJavaVersion(final PrintStream logger, String javaCommand,
+            final BufferedReader r, final StringWriter output)
+            throws IOException {
+        String line;
+        while (null != (line = r.readLine())) {
+            output.write(line);
+            output.write("\n");
+            line = line.toLowerCase();
+            if (line.startsWith("java version \"")
+                    || line.startsWith("openjdk version \"")) {
+                final String versionStr = line.substring(
+                        line.indexOf('\"') + 1, line.lastIndexOf('\"'));
+                logger.println(Messages.SSHLauncher_JavaVersionResult(
+                        getTimestamp(), javaCommand, versionStr));
 
-				// parse as a number and we should be OK as all we care about is up through the first dot.
-				try {
-					final Number version =
-						NumberFormat.getNumberInstance(Locale.US).parse(versionStr);
-					if(version.doubleValue() < 1.5) {
-						throw new IOException(Messages
-								.SSHLauncher_NoJavaFound(line));
-					}
-				} catch(final ParseException e) {
-					throw new IOException(Messages.SSHLauncher_NoJavaFound(line));
-				}
-				return javaCommand;
-			}
-		}
-		return null;
-	}
+                // parse as a number and we should be OK as all we care about is up through the first dot.
+                try {
+                    final Number version =
+                        NumberFormat.getNumberInstance(Locale.US).parse(versionStr);
+                    if(version.doubleValue() < 1.5) {
+                        throw new IOException(Messages
+                                .SSHLauncher_NoJavaFound(line));
+                    }
+                } catch(final ParseException e) {
+                    throw new IOException(Messages.SSHLauncher_NoJavaFound(line));
+                }
+                return javaCommand;
+            }
+        }
+        return null;
+    }
 
     protected void openConnection(TaskListener listener) throws IOException, InterruptedException {
         listener.getLogger().println(Messages.SSHLauncher_OpeningSSHConnection(getTimestamp(), host + ":" + port));
