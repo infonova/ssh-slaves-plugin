@@ -8,7 +8,7 @@
   </parent>
 
   <artifactId>ssh-slaves</artifactId>
-  <version>1.9-INFONVA-2-SNAPSHOT</version>
+  <version>1.9-INFONOVA-1</version>
   <packaging>hpi</packaging>
 
   <name>Jenkins SSH Slaves plugin</name>
@@ -33,7 +33,7 @@
     <connection>scm:git:ssh://git.infonova.at:29418/jenkins/plugins/ssh-slaves-plugin.git</connection>
     <developerConnection>scm:git:ssh://git.infonova.at:29418/jenkins/plugins/ssh-slaves-plugin.git</developerConnection>
     <url>http://grzsvn01.infonova.at/ise/tools/jenkins/plugins/ssh-slaves-plugin/trunk</url>
-    <tag>HEAD</tag>
+    <tag>ssh-slaves-1.9-INFONOVA-1</tag>
   </scm>
 
   <distributionManagement>
